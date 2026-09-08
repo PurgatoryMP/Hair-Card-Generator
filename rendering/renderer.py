@@ -2,129 +2,216 @@ from __future__ import annotations
 
 import math
 import random
+import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
 from model.hair_style import HairStyle
 from model.project import Project
 from rendering.cache import RenderCache
 from rendering.compositor import composite_tile
-from rendering.geometry import RenderProfile, build_mass_points, build_profile
+from rendering.geometry import RenderProfile, build_mass_points, build_profile, build_strand_batch
 from rendering.noise import SmoothNoise
-from rendering.rasterizer import draw_segment
-from utils.colors import hex_to_rgb, lerp_color
-from utils.math import clamp, lerp
+from utils.colors import hex_to_rgb
+from utils.math import clamp
 
-_DEFAULT_CACHE = RenderCache(max_entries=96, renderer_version=2)
+_DEFAULT_CACHE = RenderCache(max_entries=96, renderer_version=4)
+
+
+def _rgb_array(hex_color: str) -> np.ndarray:
+    return np.asarray(hex_to_rgb(hex_color), dtype=np.float32)
+
+
+def _color_ramp(profile: RenderProfile, root, mid, tip) -> np.ndarray:
+    t = profile.t[:, None]
+    a = np.clip(t * 2.0, 0.0, 1.0)
+    b = np.clip((t - 0.5) * 2.0, 0.0, 1.0)
+    first = root[None, :] + (mid[None, :] - root[None, :]) * a
+    second = mid[None, :] + (tip[None, :] - mid[None, :]) * b
+    return np.where((t <= 0.5), first, second).astype(np.float32)
+
 
 class HairRenderer:
-    """Procedural hair-card renderer with precomputed profiles and card caching."""
-    def __init__(self, supersample: int = 2, cache: RenderCache | None = None):
-        self.supersample=max(1,int(supersample))
-        self.cache=cache or _DEFAULT_CACHE
+    """NumPy-accelerated procedural hair renderer with density-mask compositing."""
 
-    @staticmethod
-    def _random_style_color(rng: random.Random, base: tuple[int,int,int], variation: float):
-        delta=255.0*variation
-        return tuple(int(clamp(channel+rng.uniform(-delta,delta),0,255)) for channel in base)
+    def __init__(self, supersample: int = 2, cache: RenderCache | None = None):
+        self.supersample = max(1, int(supersample))
+        self.cache = cache or _DEFAULT_CACHE
 
     def _render_card_uncached(self, style: HairStyle, width: int, height: int, seed: int, show_background: bool) -> Image.Image:
-        ss=self.supersample
-        W=max(4,int(width*ss)); H=max(4,int(height*ss))
-        rng=random.Random(seed)
-        image=Image.new("RGBA",(W,H),(0,0,0,0)); draw=ImageDraw.Draw(image)
-        if show_background:
-            bg=hex_to_rgb("#202020"); draw.rectangle((0,0,W,H),fill=(*bg,255))
-        min_dim=min(W,H)
-        safe_margin=min_dim*(style.safe_margin_pct/100.0)
-        effective_length=max(8.0,(H-2.0*safe_margin)*(style.length_pct/100.0))
-        y_start=safe_margin
-        usable_width=max(1.0,W-2.0*safe_margin)
-        wave_amplitude=W*(style.wave_amplitude_pct/100.0)
-        secondary_amplitude=W*(style.secondary_wave_amplitude_pct/100.0)
-        frizz_amplitude=W*(style.frizz_pct/100.0)
-        tip_spread=W*(style.tip_spread_pct/100.0)
-        center_x=W*0.5
-        clump_count=max(1,int(style.clump_count))
-        max_segments=max(80,68,60)
-        profile80=build_profile(style,usable_width,81)
-        profile68=build_profile(style,usable_width,69)
-        profile60=build_profile(style,usable_width,61)
-        mass_profile=build_profile(style,usable_width,70)
-        mid_rgb=hex_to_rgb(style.mid_color)
-        root_rgb=hex_to_rgb(style.root_color)
-        tip_rgb=hex_to_rgb(style.tip_color)
-        highlight_rgb=hex_to_rgb(style.highlight_color)
-        # Precompute the base color ramp once.
-        def color_ramp(profile: RenderProfile):
-            out=[]
-            for t in profile.t:
-                if t<0.5: c=lerp_color(root_rgb,mid_rgb,t*2.0)
-                else: c=lerp_color(mid_rgb,tip_rgb,(t-0.5)*2.0)
-                out.append(c)
-            return tuple(out)
-        colors80=color_ramp(profile80); colors68=color_ramp(profile68); colors60=color_ramp(profile60)
+        ss = self.supersample
+        W = max(4, int(width * ss))
+        H = max(4, int(height * ss))
+        rng = np.random.default_rng(int(seed))
+        py_rng = random.Random(int(seed))
 
-        mass=Image.new("RGBA",(W,H),(0,0,0,0)); mass_draw=ImageDraw.Draw(mass)
-        for pts in build_mass_points(style,mass_profile,center_x=center_x,safe_margin=safe_margin,width=W,y_start=y_start,effective_length=effective_length,clump_count=clump_count,wave_amplitude=wave_amplitude):
-            mass_draw.line([(int(x),int(y)) for x,y in pts],fill=(*mid_rgb,22),width=max(1,int(min_dim*0.010)))
-        mass=mass.filter(ImageFilter.GaussianBlur(radius=max(1.0,2.5*ss)))
+        image = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        if show_background:
+            bg = hex_to_rgb("#202020")
+            ImageDraw.Draw(image).rectangle((0, 0, W, H), fill=(*bg, 255))
+
+        min_dim = min(W, H)
+        safe_margin = min_dim * (style.safe_margin_pct / 100.0)
+        effective_length = max(8.0, (H - 2.0 * safe_margin) * (style.length_pct / 100.0))
+        y_start = safe_margin
+        usable_width = max(1.0, W - 2.0 * safe_margin)
+        wave_amplitude = W * (style.wave_amplitude_pct / 100.0)
+        secondary_amplitude = W * (style.secondary_wave_amplitude_pct / 100.0)
+        frizz_amplitude = W * (style.frizz_pct / 100.0)
+        tip_spread = W * (style.tip_spread_pct / 100.0)
+        center_x = W * 0.5
+        clump_count = max(1, int(style.clump_count))
+
+        profile80 = build_profile(style, usable_width, 81)
+        profile68 = build_profile(style, usable_width, 69)
+        profile60 = build_profile(style, usable_width, 61)
+        mass_profile = build_profile(style, usable_width, 70)
+
+        root_rgb = _rgb_array(style.root_color)
+        mid_rgb = _rgb_array(style.mid_color)
+        tip_rgb = _rgb_array(style.tip_color)
+        highlight_rgb = _rgb_array(style.highlight_color)
+        colors80 = _color_ramp(profile80, root_rgb, mid_rgb, tip_rgb)
+        colors68 = _color_ramp(profile68, root_rgb, mid_rgb, tip_rgb)
+        colors60 = _color_ramp(profile60, root_rgb, mid_rgb, tip_rgb)
+
+        # Low-frequency volumetric mass. It is deliberately kept separate from
+        # the strand layer so density can be tuned without changing geometry.
+        mass = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        mass_draw = ImageDraw.Draw(mass)
+        mass_width = max(1, int(min_dim * 0.010))
+        for pts in build_mass_points(style, mass_profile, center_x=center_x, safe_margin=safe_margin,
+                                     width=W, y_start=y_start, effective_length=effective_length,
+                                     clump_count=clump_count, wave_amplitude=wave_amplitude):
+            mass_draw.line([(int(x), int(y)) for x, y in pts], fill=(*mid_rgb.astype(np.uint8), 22), width=mass_width, joint="curve")
+        mass = mass.filter(ImageFilter.GaussianBlur(radius=max(1.0, 2.5 * ss)))
         image.alpha_composite(mass)
 
-        def draw_strand(root_norm,clump_target_norm,phase,amp_scale,noise_seed,width_scale,color_shift,tip_offset,length_scale,opacity,width_multiplier,is_highlight,profile,colors):
-            noise=SmoothNoise(noise_seed)
-            prev=None
-            shift=255.0*color_shift
-            strand_length=effective_length*clamp(length_scale,0.05,1.0)
-            for i,t in enumerate(profile.t):
-                envelope=profile.envelope[i]; half=profile.half_width[i]; ratio=profile.width_ratio[i]
-                strand_x=(root_norm-0.5)*2.0*half
-                clump_x=(clump_target_norm-0.5)*2.0*half
-                base_x=strand_x+(clump_x-strand_x)*(profile.smooth[i]*style.clump_strength)
-                macro=math.sin(math.tau*style.wave_cycles*t+phase)*wave_amplitude*amp_scale*envelope
-                secondary=math.sin(math.tau*style.secondary_wave_cycles*t+phase*1.71)*secondary_amplitude*amp_scale*envelope*ratio
-                micro=noise.sample(t,style.frizz_frequency)*frizz_amplitude*profile.smooth[i]*ratio
-                tip_break=tip_offset*tip_spread*profile.tip_break_profile[i]*ratio
-                x=clamp(center_x+base_x+macro+secondary+micro+tip_break,safe_margin,W-safe_margin)
-                y=y_start+strand_length*t
-                width_px=max(0.45*ss,style.strand_width_px*ss*width_multiplier*width_scale*profile.root_profile[i]*profile.tip_profile[i])
-                base_color=colors[i]
-                color=tuple(int(clamp(c+shift,0,255)) for c in base_color)
-                if is_highlight:
-                    h=style.highlight_strength*profile.smoother[i]
-                    color=lerp_color(color,highlight_rgb,h)
-                alpha=int(clamp(opacity*profile.alpha_fade[i],0,255))
-                cur=(x,y)
-                if prev is not None: draw_segment(draw,prev,cur,color,alpha,round(width_px))
-                prev=cur
+        # Two independent fields: visible appearance and accumulated density.
+        # Density is later used as an alpha modulation pass, which gives dense
+        # regions stronger lock structure without forcing every strand opaque.
+        strand_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        strand_draw = ImageDraw.Draw(strand_layer)
+        density_layer = Image.new("L", (W, H), 0)
+        density_draw = ImageDraw.Draw(density_layer)
 
-        primary=max(0,int(style.primary_strands))
-        for _ in range(primary):
-            root_norm=rng.triangular(0.0,1.0,0.5); ci=rng.randrange(clump_count); clump_norm=0.5 if clump_count==1 else ci/(clump_count-1)
-            draw_strand(root_norm,clump_norm,rng.uniform(0,math.tau),rng.uniform(0.78,1.24),rng.randrange(0,2**31-1),rng.uniform(1.0-style.strand_width_variation,1.0+style.strand_width_variation),rng.uniform(-style.color_variation,style.color_variation),rng.uniform(-0.5,0.5),rng.uniform(1.0-style.length_variation_pct/100.0,1.0),style.opacity,1.0,rng.random()<style.highlight_probability,profile80,colors80)
-        secondary=max(0,int(style.secondary_strands))
-        for _ in range(secondary):
-            root_norm=rng.uniform(0.0,1.0); ci=rng.randrange(clump_count); clump_norm=0.5 if clump_count==1 else ci/(clump_count-1)
-            draw_strand(root_norm,clump_norm,rng.uniform(0,math.tau),rng.uniform(0.72,1.30),rng.randrange(0,2**31-1),rng.uniform(0.55,1.0),rng.uniform(-style.color_variation*0.7,style.color_variation*0.7),rng.uniform(-0.7,0.7),rng.uniform(1.0-style.length_variation_pct/100.0,1.0),style.secondary_opacity,0.60,False,profile68,colors68)
-        for _ in range(max(0,int(style.flyaway_strands))):
-            root_norm=rng.uniform(0.0,1.0); ci=rng.randrange(clump_count); clump_norm=0.5 if clump_count==1 else ci/(clump_count-1)
-            draw_strand(root_norm,clump_norm,rng.uniform(0,math.tau),rng.uniform(0.9,1.7),rng.randrange(0,2**31-1),rng.uniform(0.2,0.6),rng.uniform(-style.color_variation,style.color_variation),rng.uniform(-1.0,1.0),rng.uniform(1.0-style.length_variation_pct/100.0,1.0),style.flyaway_opacity,0.42,False,profile60,colors60)
-        if ss>1: image=image.resize((width,height),Image.Resampling.LANCZOS)
+        def render_batch(count, profile, colors, opacity, width_multiplier, amp_lo, amp_hi, root_uniform, variation_scale,
+                         tip_range, length_range, highlight_probability, highlight_allowed, noise_seed_base):
+            count = max(0, int(count))
+            if not count:
+                return
+            phases = rng.uniform(0.0, math.tau, count).astype(np.float32)
+            amp_scales = rng.uniform(amp_lo, amp_hi, count).astype(np.float32)
+            root_norms = (rng.triangular(0.0, 0.5, 1.0, count) if root_uniform == "triangular" else rng.uniform(0.0, 1.0, count)).astype(np.float32)
+            clump_ids = rng.integers(0, clump_count, count)
+            clump_norms = (0.5 if clump_count == 1 else clump_ids / float(clump_count - 1)).astype(np.float32)
+            width_scales = rng.uniform(variation_scale[0], variation_scale[1], count).astype(np.float32)
+            color_shifts = rng.uniform(-style.color_variation * variation_scale[2], style.color_variation * variation_scale[2], count).astype(np.float32)
+            tip_offsets = rng.uniform(tip_range[0], tip_range[1], count).astype(np.float32)
+            length_scales = rng.uniform(length_range[0], length_range[1], count).astype(np.float32)
+            noise_phases = rng.uniform(0.0, math.tau, (count, 5)).astype(np.float32)
+            noise_offsets = rng.uniform(0.0, 1000.0, (count, 5)).astype(np.float32)
+
+            x, y = build_strand_batch(
+                style=style, profile=profile, phases=phases, amp_scales=amp_scales,
+                root_norms=root_norms, clump_norms=clump_norms,
+                frizz_amplitude=frizz_amplitude, wave_amplitude=wave_amplitude,
+                secondary_amplitude=secondary_amplitude, tip_spread=tip_spread,
+                tip_offsets=tip_offsets, length_scales=length_scales,
+                center_x=center_x, safe_margin=safe_margin, canvas_width=W,
+                y_start=y_start, effective_length=effective_length,
+                noise_phases=noise_phases, noise_offsets=noise_offsets,
+            )
+
+            # Appearance is calculated for every strand/segment in one NumPy pass.
+            widths = np.maximum(
+                0.45 * ss,
+                style.strand_width_px * ss * width_multiplier
+                * width_scales[:, None] * profile.root_profile[None, :] * profile.tip_profile[None, :],
+            )
+            shifts = (255.0 * color_shifts)[:, None, None]
+            rgb = np.clip(colors[None, :, :] + shifts, 0.0, 255.0)
+            if highlight_allowed:
+                highlight = rng.random(count) < highlight_probability
+                h = style.highlight_strength * profile.smoother[None, :]
+                rgb = np.where(highlight[:, None, None], rgb * (1.0 - h[:, :, None]) + highlight_rgb[None, None, :] * h[:, :, None], rgb)
+
+            alpha = np.broadcast_to(np.clip(opacity * profile.alpha_fade[None, :], 0, 255), (count, profile.t.size)).astype(np.uint8)
+            density_alpha = np.clip(alpha.astype(np.float32) * (0.55 if width_multiplier < 1.0 else 0.78), 0, 255).astype(np.uint8)
+
+            # Reduce the 81/69/61 samples to ten raster bands in one NumPy pass.
+            # The Python loop below only handles Pillow draw calls.
+            bands = 10
+            point_count = x.shape[1]
+            starts = np.asarray([(b * (point_count - 1)) // bands for b in range(bands)], dtype=np.int32)
+            ends = np.asarray([((b + 1) * (point_count - 1)) // bands + 1 for b in range(bands)], dtype=np.int32)
+            band_widths = np.empty((count, bands), dtype=np.int16)
+            band_colors = np.empty((count, bands, 3), dtype=np.uint8)
+            band_alpha = np.empty((count, bands), dtype=np.uint8)
+            for b, (a0, a1) in enumerate(zip(starts, ends)):
+                band_widths[:, b] = np.maximum(1, np.rint(widths[:, a0:a1].mean(axis=1))).astype(np.int16)
+                band_colors[:, b] = np.clip(rgb[:, a0:a1].mean(axis=1), 0, 255).astype(np.uint8)
+                band_alpha[:, b] = alpha[:, a0:a1].max(axis=1)
+
+            for j in range(count):
+                for b, (a0, a1) in enumerate(zip(starts, ends)):
+                    pts = [(int(round(px)), int(round(py))) for px, py in zip(x[j, a0:a1], y[j, a0:a1])]
+                    if len(pts) < 2:
+                        continue
+                    color = band_colors[j, b]
+                    strand_draw.line(pts, fill=(int(color[0]), int(color[1]), int(color[2]), int(band_alpha[j, b])),
+                                      width=int(band_widths[j, b]), joint="curve")
+                full_pts = [(int(round(px)), int(round(py))) for px, py in zip(x[j], y[j])]
+                density_draw.line(full_pts, fill=int(np.max(density_alpha[j])),
+                                  width=max(1, int(round(float(np.mean(widths[j]))))), joint="curve")
+
+        primary = max(0, int(style.primary_strands))
+        render_batch(primary, profile80, colors80, style.opacity, 1.0, 0.78, 1.24, "triangular",
+                     (1.0 - style.strand_width_variation, 1.0 + style.strand_width_variation, 1.0),
+                     (-0.5, 0.5), (1.0 - style.length_variation_pct / 100.0, 1.0), style.highlight_probability, True, seed)
+        secondary = max(0, int(style.secondary_strands))
+        render_batch(secondary, profile68, colors68, style.secondary_opacity, 0.60, 0.72, 1.30, "uniform",
+                     (0.55, 1.0, 0.7), (-0.7, 0.7), (1.0 - style.length_variation_pct / 100.0, 1.0), 0.0, False, seed + 1)
+        flyaways = max(0, int(style.flyaway_strands))
+        render_batch(flyaways, profile60, colors60, style.flyaway_opacity, 0.42, 0.90, 1.70, "uniform",
+                     (0.2, 0.6, 1.0), (-1.0, 1.0), (1.0 - style.length_variation_pct / 100.0, 1.0), 0.0, False, seed + 2)
+
+        # Density-mask pass. A small blur turns discrete strand coverage into a
+        # continuous field. We only modulate alpha, preserving the RGB detail.
+        density = np.asarray(density_layer, dtype=np.float32)
+        density = np.minimum(255.0, density * 1.12)
+        density = np.asarray(Image.fromarray(density.astype(np.uint8), mode="L").filter(
+            ImageFilter.GaussianBlur(radius=max(0.35, 0.55 * ss))
+        ), dtype=np.float32)
+
+        rgba = np.asarray(strand_layer, dtype=np.uint8).copy()
+        rgba[..., 3] = np.minimum(rgba[..., 3].astype(np.float32), density).astype(np.uint8)
+        final_layer = Image.fromarray(rgba, mode="RGBA")
+        image.alpha_composite(final_layer)
+
+        if ss > 1:
+            image = image.resize((width, height), Image.Resampling.LANCZOS)
         return image
 
-    def render_card(self, style: HairStyle, width: int, height: int, seed: int, show_background: bool=False) -> Image.Image:
-        key=self.cache.key(style,width,height,seed,self.supersample,show_background)
-        cached=self.cache.get(key)
-        if cached is not None: return cached
-        image=self._render_card_uncached(style,width,height,seed,show_background)
-        self.cache.put(key,image)
+    def render_card(self, style: HairStyle, width: int, height: int, seed: int, show_background: bool = False) -> Image.Image:
+        key = self.cache.key(style, width, height, seed, self.supersample, show_background)
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached.copy()
+        image = self._render_card_uncached(style, width, height, seed, show_background)
+        self.cache.put(key, image)
         return image.copy()
 
     def render_sheet(self, project: Project) -> Image.Image:
         project.normalize_card_count()
-        cell_w=project.width//project.columns; cell_h=project.height//project.rows
-        sheet=Image.new("RGBA",(project.width,project.height),(0,0,0,0))
-        for idx,card in enumerate(project.cards):
-            row=idx//project.columns; col=idx%project.columns; x=col*cell_w; y=row*cell_h
-            w=cell_w if col<project.columns-1 else project.width-x; h=cell_h if row<project.rows-1 else project.height-y
-            composite_tile(sheet,self.render_card(card.style,w,h,card.seed),x,y)
+        cell_w = project.width // project.columns
+        cell_h = project.height // project.rows
+        sheet = Image.new("RGBA", (project.width, project.height), (0, 0, 0, 0))
+        for idx, card in enumerate(project.cards):
+            row = idx // project.columns
+            col = idx % project.columns
+            x = col * cell_w
+            y = row * cell_h
+            w = cell_w if col < project.columns - 1 else project.width - x
+            h = cell_h if row < project.rows - 1 else project.height - y
+            composite_tile(sheet, self.render_card(card.style, w, h, card.seed), x, y)
         return sheet

@@ -1236,9 +1236,11 @@ class HairCardEditor(QMainWindow):
         """
         if not self.project.cards:
             return
-        self._copied_style = copy.deepcopy(
-            self.project.cards[self.selected_index].style
-        )
+        # Controls are normally synchronized continuously, but committing the
+        # active control values here makes Copy deterministic even when a caller
+        # invokes it immediately after a selection/control transition.
+        self._write_controls_to_selected()
+        self._copied_style = copy.deepcopy(self.project.cards[self.selected_index].style)
         self.render_status.setText(
             f"Copied style from Card {self.selected_index + 1}"
         )
@@ -1246,6 +1248,9 @@ class HairCardEditor(QMainWindow):
 
     def _paste_style(self):
         """Paste the clipboard style into all selected cards.
+
+        Bulk mutations invalidate the current render generation before the
+        mutation, so an obsolete worker can never win a race with this action.
         """
         if self._copied_style is None:
             QMessageBox.information(
@@ -1255,13 +1260,20 @@ class HairCardEditor(QMainWindow):
             )
             return
 
-        for index in sorted(self.selected_indices):
+        targets = sorted(self.selected_indices) or [self.selected_index]
+        self._render_generation += 1
+        self._pending_render = None
+        for index in targets:
             current_name = self.project.cards[index].style.name
             self.project.cards[index].style = copy.deepcopy(self._copied_style)
             self.project.cards[index].style.name = current_name
 
         self._load_card_to_controls()
-        self._schedule_selected_cards_preview(delay=False)
+        self._update_card_info()
+        if self.live_preview.isChecked():
+            self._schedule_selected_cards_preview(delay=False)
+        else:
+            self.render_status.setText("Pasted style — click Render Selected")
         self.render_status.setText(
             f"Pasted style to {len(self.selected_indices)} card(s)"
         )
@@ -1282,13 +1294,19 @@ class HairCardEditor(QMainWindow):
             return
 
         rng = random.Random()
+        self._render_generation += 1
+        self._pending_render = None
         for index in targets:
             self.project.cards[index].style = copy.deepcopy(source.style)
             self.project.cards[index].style.name = f"{source.style.name} Copy"
             self.project.cards[index].seed = rng.randint(0, 2147483647)
 
         self._load_card_to_controls()
-        self._schedule_selected_cards_preview(delay=False)
+        self._update_card_info()
+        if self.live_preview.isChecked():
+            self._schedule_selected_cards_preview(delay=False)
+        else:
+            self.render_status.setText("Duplicated style — click Render Selected")
 
     def _randomize_selected(self):
         """Generate randomized styles, colors, and seeds for selected cards.
@@ -1298,6 +1316,8 @@ class HairCardEditor(QMainWindow):
 
         rng = random.Random()
         selections = sorted(self.selected_indices) or [self.selected_index]
+        self._render_generation += 1
+        self._pending_render = None
 
         for index in selections:
             preset_name, base = rng.choice(self.STYLE_PRESETS)
@@ -1343,7 +1363,11 @@ class HairCardEditor(QMainWindow):
             card.seed = rng.randint(0, 2147483647)
 
         self._load_card_to_controls()
-        self._schedule_selected_cards_preview(delay=False)
+        self._update_card_info()
+        if self.live_preview.isChecked():
+            self._schedule_selected_cards_preview(delay=False)
+        else:
+            self.render_status.setText("Randomized selected cards — click Render Selected")
 
     def _choose_color(self, attr: str):
         """Open a color picker and apply the selected color to the selected cards.
