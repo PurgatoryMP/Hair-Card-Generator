@@ -22,5 +22,6 @@ This project is a standalone Hair card generator for quick and easy hair card tr
 * Numpy
 
 ## Screenshots
+![Using the Tool](https://gyazo.com/a59ff705e94f4b1858cb032688a445a7)
 
 ![Screenshot 1](screenshots/UI.PNG)
