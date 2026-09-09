@@ -13,8 +13,8 @@ class HairStyle:
     middle_width_pct: float = 48.0
     tip_width_pct: float = 30.0
 
-    primary_strands: int = 150
-    secondary_strands: int = 100
+    primary_strands: int = 50
+    secondary_strands: int = 50
     flyaway_strands: int = 20
 
     clump_count: int = 8
@@ -31,6 +31,9 @@ class HairStyle:
     tip_spread_pct: float = 10.0
     tip_breakup: float = 0.20
 
+    # Per-strand raster width at the root and tip.  strand_width_px is retained
+    # as the end/tip width for backwards-compatible project files.
+    strand_start_width_px: float = 1.55
     strand_width_px: float = 1.55
     strand_width_variation: float = 0.35
 
@@ -49,3 +52,13 @@ class HairStyle:
 
     # Distance from the card boundary in percent of the smaller dimension.
     safe_margin_pct: float = 3.0
+
+    # Optional procedural braid structure. When disabled, the existing loose-hair
+    # strand geometry is used unchanged. Braid controls shape the lateral motion
+    # of strand groups around a shared centerline.
+    braid_enabled: bool = False
+    braid_strands: int = 3
+    braid_cycles: float = 8.0
+    braid_width_pct: float = 70.0
+    braid_tightness: float = 0.75
+    braid_taper_pct: float = 25.0

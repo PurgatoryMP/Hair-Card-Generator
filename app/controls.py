@@ -52,7 +52,9 @@ class SliderControl(QWidget):
         self.slider.valueChanged.connect(self._slider_changed)
 
         self.value_label = QLabel()
-        self.value_label.setMinimumWidth(58)
+        # Fixed width prevents the inspector/form layout from reflowing when
+        # values change digit count (for example 9 -> 10 or 0 -> 100).
+        self.value_label.setFixedWidth(64)
         self.value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         layout = QHBoxLayout(self)

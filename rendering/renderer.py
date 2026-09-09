@@ -14,7 +14,7 @@ from rendering.noise import SmoothNoise
 from utils.colors import hex_to_rgb
 from utils.math import clamp
 
-_DEFAULT_CACHE = RenderCache(max_entries=96, renderer_version=4)
+_DEFAULT_CACHE = RenderCache(max_entries=96, renderer_version=6)
 
 
 def _rgb_array(hex_color: str) -> np.ndarray:
@@ -28,6 +28,65 @@ def _color_ramp(profile: RenderProfile, root, mid, tip) -> np.ndarray:
     first = root[None, :] + (mid[None, :] - root[None, :]) * a
     second = mid[None, :] + (tip[None, :] - mid[None, :]) * b
     return np.where((t <= 0.5), first, second).astype(np.float32)
+
+
+def _apply_braid_structure(
+    x: np.ndarray,
+    style: HairStyle,
+    profile: RenderProfile,
+    root_norms: np.ndarray,
+    clump_norms: np.ndarray,
+    phases: np.ndarray,
+    amp_scales: np.ndarray,
+) -> np.ndarray:
+    """Transform loose strand positions into interweaving braid group paths.
+
+    The existing strand deformation (wave, frizz, tip breakup, etc.) is retained.
+    Only the lateral distribution is replaced by a small number of phase-offset
+    group trajectories, producing the characteristic repeated crossings of a
+    braid without requiring a separate raster backend.
+    """
+    if not getattr(style, "braid_enabled", False) or x.size == 0:
+        return x
+
+    count, points = x.shape
+    group_count = max(2, min(5, int(getattr(style, "braid_strands", 3))))
+    t = profile.t[None, :]
+    half = profile.half_width[None, :]
+    smooth = profile.smooth[None, :]
+
+    # Remove the normal full-width root/clump placement. Braid strands instead
+    # live around a handful of coherent trajectories. A small residual offset
+    # preserves natural strand thickness within each woven section.
+    clump_strength = float(style.clump_strength)
+    base_x = (root_norms[:, None] - 0.5) * 2.0 * half
+    clump_x = (clump_norms[:, None] - 0.5) * 2.0 * half
+    loose_offset = base_x + (clump_x - base_x) * (smooth * clump_strength)
+
+    # Three groups are the conventional braid. Additional groups are supported
+    # for stylized braids, while the UI keeps the range deliberately small.
+    group_ids = np.arange(count, dtype=np.int32) % group_count
+    group_phase = (math.tau * group_ids / float(group_count)).astype(np.float32)[:, None]
+    braid_cycles = max(1.0, float(getattr(style, "braid_cycles", 8.0)))
+    width_factor = np.clip(float(getattr(style, "braid_width_pct", 70.0)) / 100.0, 0.0, 1.0)
+    tightness = np.clip(float(getattr(style, "braid_tightness", 0.75)), 0.0, 1.0)
+    taper = np.clip(float(getattr(style, "braid_taper_pct", 25.0)) / 100.0, 0.0, 0.9)
+
+    # Higher tightness produces more compact, clearly separated braid lobes.
+    amplitude = half * width_factor * (0.30 + 0.42 * tightness)
+    taper_factor = 1.0 - taper * t
+    weave = np.sin(math.tau * braid_cycles * t + group_phase)
+    weave *= amplitude * taper_factor
+
+    # Preserve a little per-strand variation inside each woven group.
+    local_spread = (root_norms[:, None] - 0.5) * 0.12 * half
+    local_spread *= (0.75 + 0.25 * amp_scales[:, None])
+
+    # The braid path itself is centered, while the existing waves/frizz remain
+    # in x. Removing loose_offset prevents the normal hair distribution from
+    # fighting the braid trajectory.
+    result = x - loose_offset + weave + local_spread
+    return result.astype(np.float32)
 
 
 class HairRenderer:
@@ -59,7 +118,7 @@ class HairRenderer:
         frizz_amplitude = W * (style.frizz_pct / 100.0)
         tip_spread = W * (style.tip_spread_pct / 100.0)
         center_x = W * 0.5
-        clump_count = max(1, int(style.clump_count))
+        clump_count = max(0, int(style.clump_count))
 
         profile80 = build_profile(style, usable_width, 81)
         profile68 = build_profile(style, usable_width, 69)
@@ -79,10 +138,15 @@ class HairRenderer:
         mass = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         mass_draw = ImageDraw.Draw(mass)
         mass_width = max(1, int(min_dim * 0.010))
-        for pts in build_mass_points(style, mass_profile, center_x=center_x, safe_margin=safe_margin,
-                                     width=W, y_start=y_start, effective_length=effective_length,
-                                     clump_count=clump_count, wave_amplitude=wave_amplitude):
-            mass_draw.line([(int(x), int(y)) for x, y in pts], fill=(*mid_rgb.astype(np.uint8), 22), width=mass_width, joint="curve")
+        if clump_count > 0 and not getattr(style, "braid_enabled", False):
+            # Normal clump mass intentionally spans the loose-hair silhouette.
+            # In braid mode it would create stray side rails that fight the
+            # interweaving structure, so the braid relies on its strand-density
+            # field instead.
+            for pts in build_mass_points(style, mass_profile, center_x=center_x, safe_margin=safe_margin,
+                                         width=W, y_start=y_start, effective_length=effective_length,
+                                         clump_count=clump_count, wave_amplitude=wave_amplitude):
+                mass_draw.line([(int(x), int(y)) for x, y in pts], fill=(*mid_rgb.astype(np.uint8), 22), width=mass_width, joint="curve")
         mass = mass.filter(ImageFilter.GaussianBlur(radius=max(1.0, 2.5 * ss)))
         image.alpha_composite(mass)
 
@@ -102,8 +166,13 @@ class HairRenderer:
             phases = rng.uniform(0.0, math.tau, count).astype(np.float32)
             amp_scales = rng.uniform(amp_lo, amp_hi, count).astype(np.float32)
             root_norms = (rng.triangular(0.0, 0.5, 1.0, count) if root_uniform == "triangular" else rng.uniform(0.0, 1.0, count)).astype(np.float32)
-            clump_ids = rng.integers(0, clump_count, count)
-            clump_norms = (0.5 if clump_count == 1 else clump_ids / float(clump_count - 1)).astype(np.float32)
+            if clump_count > 0:
+                clump_ids = rng.integers(0, clump_count, count)
+                clump_norms = (0.5 if clump_count == 1 else clump_ids / float(clump_count - 1)).astype(np.float32)
+            else:
+                # Zero clumps means a deliberately un-clumped distribution.
+                # Keep the batch numerically valid and disable the clump blend.
+                clump_norms = np.full(count, 0.5, dtype=np.float32)
             width_scales = rng.uniform(variation_scale[0], variation_scale[1], count).astype(np.float32)
             color_shifts = rng.uniform(-style.color_variation * variation_scale[2], style.color_variation * variation_scale[2], count).astype(np.float32)
             tip_offsets = rng.uniform(tip_range[0], tip_range[1], count).astype(np.float32)
@@ -121,11 +190,35 @@ class HairRenderer:
                 y_start=y_start, effective_length=effective_length,
                 noise_phases=noise_phases, noise_offsets=noise_offsets,
             )
+            if getattr(style, "braid_enabled", False):
+                x = _apply_braid_structure(
+                    x, style, profile, root_norms, clump_norms, phases, amp_scales
+                )
+                x = np.clip(x, safe_margin, W - safe_margin).astype(np.float32)
+            if clump_count <= 0:
+                # Remove only the clump attraction while preserving wave,
+                # secondary wave, frizz, tip breakup, and length geometry.
+                smooth = profile.smooth[None, :]
+                half = profile.half_width[None, :]
+                base_x = (root_norms[:, None] - 0.5) * 2.0 * half
+                clump_x = (clump_norms[:, None] - 0.5) * 2.0 * half
+                x -= (clump_x - base_x) * (smooth * style.clump_strength)
+                x = np.clip(x, safe_margin, W - safe_margin).astype(np.float32)
 
             # Appearance is calculated for every strand/segment in one NumPy pass.
+            # Strand width is independently controlled at the root and tip.
+            # Smooth interpolation preserves the existing look when both values
+            # are equal, while allowing deliberately thicker roots with fewer
+            # strands for broader, more stylized hair.
+            width_t = profile.t[None, :]
+            width_interp = (
+                style.strand_start_width_px
+                + (style.strand_width_px - style.strand_start_width_px) * width_t
+            )
+            width_interp = np.maximum(0.0, width_interp)
             widths = np.maximum(
                 0.45 * ss,
-                style.strand_width_px * ss * width_multiplier
+                width_interp * ss * width_multiplier
                 * width_scales[:, None] * profile.root_profile[None, :] * profile.tip_profile[None, :],
             )
             shifts = (255.0 * color_shifts)[:, None, None]

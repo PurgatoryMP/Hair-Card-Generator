@@ -54,6 +54,7 @@ class TrimSheetView(QGraphicsView):
         self.active_index = 0
         self.project: Optional[Project] = None
         self._pix_item: Optional[QGraphicsPixmapItem] = None
+        self._has_user_view = False
 
     def set_preview_background(self, color: str):
         """Set the viewport background color.
@@ -114,7 +115,12 @@ class TrimSheetView(QGraphicsView):
 
         self._update_overlays()
         self.scene_obj.setSceneRect(0, 0, project.width, project.height)
-        if self._pix_item:
+
+        # Do not call fitInView on every render. Rendering a card changes the
+        # pixmap but should not change the user's navigation state. Only the
+        # first displayed sheet is fitted automatically; subsequent renders
+        # preserve whatever zoom/pan the user has chosen.
+        if self._pix_item and not self._has_user_view:
             self.fitInView(self._pix_item, Qt.AspectRatioMode.KeepAspectRatio)
 
     def set_selection(self, indices, active: Optional[int] = None, emit: bool = False):
@@ -205,3 +211,4 @@ class TrimSheetView(QGraphicsView):
         """
         factor = 1.15 if event.angleDelta().y() > 0 else (1.0 / 1.15)
         self.scale(factor, factor)
+        self._has_user_view = True

@@ -145,6 +145,7 @@ class HairCardEditor(QMainWindow):
         controls_layout.addWidget(self._make_card_group())
         controls_layout.addWidget(self._make_style_group())
         controls_layout.addWidget(self._make_shape_group())
+        controls_layout.addWidget(self._make_braid_group())
         controls_layout.addWidget(self._make_render_group())
         scroll.setWidget(controls_container)
         inspector_layout.addWidget(scroll, 1)
@@ -378,16 +379,16 @@ class HairCardEditor(QMainWindow):
         )
         layout.addRow("Tip Width %", self.tip_width)
 
-        self.primary = self._spin(0, 10000, 10, 150)
+        self.primary = self._spin(0, 250, 1, 50)
         layout.addRow("Primary Strands", self.primary)
 
-        self.secondary = self._spin(0, 10000, 10, 100)
+        self.secondary = self._spin(0, 250, 1, 50)
         layout.addRow("Secondary Strands", self.secondary)
 
         self.flyaways = self._spin(0, 3000, 10, 20)
         layout.addRow("Flyaway Strands", self.flyaways)
 
-        self.clump_count = self._spin(1, 128, 1, 8)
+        self.clump_count = self._spin(0, 128, 1, 8)
         layout.addRow("Clump Count", self.clump_count)
 
         self.clump_strength = self._double(0, 1, 0.01, 0.55, 2)
@@ -425,11 +426,49 @@ class HairCardEditor(QMainWindow):
         self.tip_breakup = self._double(0, 1, 0.01, 0.2, 2)
         layout.addRow("Tip Breakup", self.tip_breakup)
 
+        self.strand_start_width = self._double(0.15, 16, 0.05, 1.55, 2)
+        self.strand_start_width.setToolTip("Width of each strand at the root/start of the hair card.")
+        layout.addRow("Strand Start Width px", self.strand_start_width)
+
         self.strand_width = self._double(0.15, 16, 0.05, 1.55, 2)
-        layout.addRow("Strand Width px", self.strand_width)
+        self.strand_width.setToolTip("Width of each strand at the tip/end of the hair card.")
+        layout.addRow("Strand End Width px", self.strand_width)
 
         self.width_variation = self._double(0, 0.9, 0.01, 0.35, 2)
         layout.addRow("Width Variation", self.width_variation)
+
+        return group
+
+    def _make_braid_group(self):
+        """Create controls for the optional procedural braid structure."""
+        group = QGroupBox("Braid Structure")
+        layout = QFormLayout(group)
+
+        self.braid_enabled = QCheckBox("Enable Braid")
+        self.braid_enabled.setChecked(False)
+        self.braid_enabled.setToolTip("Replace the normal lateral strand distribution with an interweaving braid structure.")
+        self.braid_enabled.toggled.connect(self._card_changed)
+        layout.addRow(self.braid_enabled)
+
+        self.braid_strands = self._spin(2, 5, 1, 3)
+        self.braid_strands.setToolTip("Number of strand groups interweaving through the braid.")
+        layout.addRow("Braid Strands", self.braid_strands)
+
+        self.braid_cycles = self._double(1, 30, 0.1, 8.0, 1)
+        self.braid_cycles.setToolTip("Number of complete interweaving cycles along the braid.")
+        layout.addRow("Braid Cycles", self.braid_cycles)
+
+        self.braid_width = self._double(10, 100, 1, 70.0, 0)
+        self.braid_width.setToolTip("Width of the braid's interweaving path relative to the card silhouette.")
+        layout.addRow("Braid Width %", self.braid_width)
+
+        self.braid_tightness = self._double(0, 1, 0.01, 0.75, 2)
+        self.braid_tightness.setToolTip("Controls how strongly the strand groups separate and cross. Higher values make a tighter braid.")
+        layout.addRow("Braid Tightness", self.braid_tightness)
+
+        self.braid_taper = self._double(0, 90, 1, 25.0, 0)
+        self.braid_taper.setToolTip("Reduces braid width progressively toward the tip.")
+        layout.addRow("Braid Taper %", self.braid_taper)
 
         return group
 
@@ -1075,6 +1114,7 @@ class HairCardEditor(QMainWindow):
             s.frizz_frequency = self.frizz_freq.value()
             s.tip_spread_pct = self.tip_spread.value()
             s.tip_breakup = self.tip_breakup.value()
+            s.strand_start_width_px = self.strand_start_width.value()
             s.strand_width_px = self.strand_width.value()
             s.strand_width_variation = self.width_variation.value()
             s.opacity = int(self.opacity.value())
@@ -1084,6 +1124,12 @@ class HairCardEditor(QMainWindow):
             s.highlight_probability = self.highlight_probability.value()
             s.highlight_strength = self.highlight_strength.value()
             s.safe_margin_pct = self.safe_margin.value()
+            s.braid_enabled = self.braid_enabled.isChecked()
+            s.braid_strands = int(self.braid_strands.value())
+            s.braid_cycles = self.braid_cycles.value()
+            s.braid_width_pct = self.braid_width.value()
+            s.braid_tightness = self.braid_tightness.value()
+            s.braid_taper_pct = self.braid_taper.value()
 
             for attr, btn in self._color_buttons.items():
                 setattr(s, attr, btn.property("color_hex") or getattr(s, attr))
@@ -1106,6 +1152,16 @@ class HairCardEditor(QMainWindow):
         try:
             card = self.project.cards[self.selected_index]
             s = card.style
+
+            # Keep the project controls synchronized with the actual project
+            # before loading the active card. This is especially important on
+            # first launch and after loading a project; the rendered sheet and
+            # inspector must describe the same state.
+            self.sheet_width.setValue(self.project.width)
+            self.sheet_height.setValue(self.project.height)
+            self.columns.setValue(self.project.columns)
+            self.rows.setValue(self.project.rows)
+            self.card_selector.setMaximum(len(self.project.cards))
             self.card_selector.setValue(self.selected_index + 1)
             self.card_name.setText(s.name)
             self.seed.setValue(card.seed)
@@ -1129,6 +1185,7 @@ class HairCardEditor(QMainWindow):
                 self.frizz_freq: s.frizz_frequency,
                 self.tip_spread: s.tip_spread_pct,
                 self.tip_breakup: s.tip_breakup,
+                self.strand_start_width: getattr(s, "strand_start_width_px", s.strand_width_px),
                 self.strand_width: s.strand_width_px,
                 self.width_variation: s.strand_width_variation,
                 self.opacity: s.opacity,
@@ -1138,9 +1195,15 @@ class HairCardEditor(QMainWindow):
                 self.highlight_probability: s.highlight_probability,
                 self.highlight_strength: s.highlight_strength,
                 self.safe_margin: s.safe_margin_pct,
+                self.braid_strands: getattr(s, "braid_strands", 3),
+                self.braid_cycles: getattr(s, "braid_cycles", 8.0),
+                self.braid_width: getattr(s, "braid_width_pct", 70.0),
+                self.braid_tightness: getattr(s, "braid_tightness", 0.75),
+                self.braid_taper: getattr(s, "braid_taper_pct", 25.0),
             }
             for widget, value in values.items():
                 widget.setValue(value)
+            self.braid_enabled.setChecked(bool(getattr(s, "braid_enabled", False)))
 
             self._set_preset_selection(s.name)
             self._set_color_preset_selection("Custom")
@@ -1329,8 +1392,8 @@ class HairCardEditor(QMainWindow):
             style.middle_width_pct = clamp(style.middle_width_pct + rng.uniform(-18.0, 18.0), 3.0, 100.0)
             style.tip_width_pct = clamp(style.tip_width_pct + rng.uniform(-15.0, 18.0), 0.0, 100.0)
 
-            style.primary_strands = rng.randint(60, 300)
-            style.secondary_strands = rng.randint(35, 220)
+            style.primary_strands = rng.randint(40, 250)
+            style.secondary_strands = rng.randint(35, 250)
             style.flyaway_strands = rng.randint(0, 70)
             style.clump_count = rng.randint(4, 18)
             style.clump_strength = clamp(style.clump_strength + rng.uniform(-0.18, 0.18), 0.05, 0.98)
@@ -1345,6 +1408,9 @@ class HairCardEditor(QMainWindow):
             style.tip_spread_pct = clamp(style.tip_spread_pct + rng.uniform(-8.0, 18.0), 0.0, 75.0)
             style.tip_breakup = clamp(style.tip_breakup + rng.uniform(-0.14, 0.20), 0.0, 0.95)
             style.strand_width_px = clamp(style.strand_width_px + rng.uniform(-0.35, 0.45), 0.4, 4.5)
+            style.strand_start_width_px = clamp(
+                style.strand_start_width_px + rng.uniform(-0.45, 0.65), 0.4, 6.0
+            )
             style.strand_width_variation = clamp(style.strand_width_variation + rng.uniform(-0.10, 0.18), 0.0, 0.85)
             style.opacity = rng.randint(215, 248)
             style.secondary_opacity = rng.randint(75, 140)
@@ -1353,6 +1419,12 @@ class HairCardEditor(QMainWindow):
             style.highlight_probability = clamp(style.highlight_probability + rng.uniform(-0.025, 0.07), 0.0, 0.25)
             style.highlight_strength = clamp(style.highlight_strength + rng.uniform(-0.08, 0.15), 0.0, 0.9)
             style.safe_margin_pct = clamp(style.safe_margin_pct + rng.uniform(-0.8, 2.0), 0.5, 12.0)
+            style.braid_enabled = rng.random() < 0.12
+            style.braid_strands = rng.randint(3, 3)
+            style.braid_cycles = rng.uniform(5.0, 13.0)
+            style.braid_width_pct = rng.uniform(55.0, 85.0)
+            style.braid_tightness = rng.uniform(0.55, 0.9)
+            style.braid_taper_pct = rng.uniform(10.0, 45.0)
 
             _, colors = rng.choice(self.COLOR_PRESETS)
             style.root_color, style.mid_color, style.tip_color, style.highlight_color = colors
@@ -1661,6 +1733,13 @@ class HairCardEditor(QMainWindow):
                 style_data = dict(item["style"])
                 style_data.setdefault("length_variation_pct", 12.0)
                 style_data.setdefault("middle_width_pct", 48.0)
+                style_data.setdefault("strand_start_width_px", style_data.get("strand_width_px", 1.55))
+                style_data.setdefault("braid_enabled", False)
+                style_data.setdefault("braid_strands", 3)
+                style_data.setdefault("braid_cycles", 8.0)
+                style_data.setdefault("braid_width_pct", 70.0)
+                style_data.setdefault("braid_tightness", 0.75)
+                style_data.setdefault("braid_taper_pct", 25.0)
                 style = HairStyle(**style_data)
 
                 project.cards.append(

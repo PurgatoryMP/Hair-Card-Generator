@@ -29,14 +29,33 @@ def build_profile(style: HairStyle, usable_width: float, segments: int) -> Rende
     smoother = smooth * smooth * (3.0 - 2.0 * smooth)
     envelope = np.power(np.clip(np.sin(np.pi * t), 0.0, None), 0.75).astype(np.float32)
 
-    local_a = smooth.copy()
-    local_b = np.clip((t - 0.5) * 2.0, 0.0, 1.0)
-    local_b = local_b * local_b * (3.0 - 2.0 * local_b)
-    width_pct = np.where(
-        t <= 0.5,
-        style.root_width_pct + (style.middle_width_pct - style.root_width_pct) * local_a,
-        style.middle_width_pct + (style.tip_width_pct - style.middle_width_pct) * local_b,
-    ).astype(np.float32)
+    # Use a C1-continuous cubic Hermite curve through the three width
+    # controls instead of two independent smoothstep segments. The old
+    # approach forced the slope to zero at the middle control, which creates
+    # a visible pinch/flattening when root, middle, and tip widths differ.
+    # The shared middle tangent keeps the falloff smooth through the entire
+    # silhouette.
+    w0 = float(style.root_width_pct)
+    w1 = float(style.middle_width_pct)
+    w2 = float(style.tip_width_pct)
+    m0 = w1 - w0
+    m1 = 0.5 * (w2 - w0)
+    m2 = w2 - w1
+
+    def _hermite(a, b, da, db, u):
+        u2 = u * u
+        u3 = u2 * u
+        h00 = 2.0 * u3 - 3.0 * u2 + 1.0
+        h10 = u3 - 2.0 * u2 + u
+        h01 = -2.0 * u3 + 3.0 * u2
+        h11 = u3 - u2
+        return h00 * a + h10 * da + h01 * b + h11 * db
+
+    left_u = np.clip(t * 2.0, 0.0, 1.0)
+    right_u = np.clip((t - 0.5) * 2.0, 0.0, 1.0)
+    left_width = _hermite(w0, w1, m0 * 0.5, m1 * 0.5, left_u)
+    right_width = _hermite(w1, w2, m1 * 0.5, m2 * 0.5, right_u)
+    width_pct = np.where(t <= 0.5, left_width, right_width).astype(np.float32)
 
     ratio = width_pct / 100.0
     half = (usable_width * ratio * 0.5).astype(np.float32)
