@@ -23,4 +23,4 @@ This project is a standalone Hair card generator for quick and easy hair card tr
 
 ## Screenshots
 
-![Screenshot 1](screenshots/UI.png)
+![Screenshot 1](screenshots/UI.PNG)
